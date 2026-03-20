@@ -32,7 +32,10 @@ import {
   SAFE_ROLLOUT_TRACKING_KEY_PREFIX,
   NULL_DIMENSION_VALUE,
 } from "shared/constants";
-import { PIPELINE_MODE_SUPPORTED_DATA_SOURCE_TYPES } from "shared/enterprise";
+import {
+  isIngestYearMonthDayPartitionSettings,
+  PIPELINE_MODE_SUPPORTED_DATA_SOURCE_TYPES,
+} from "shared/enterprise";
 import {
   ensureLimit,
   format,
@@ -5689,6 +5692,7 @@ ORDER BY column_name, count DESC
     experimentId,
     addFiltersToWhere,
     additionalWhere,
+    additionalSelectExpressions,
     exclusiveStartDateFilter,
     exclusiveEndDateFilter,
     phase,
@@ -5703,6 +5707,7 @@ ORDER BY column_name, count DESC
     experimentId?: string;
     addFiltersToWhere?: boolean;
     additionalWhere?: string[];
+    additionalSelectExpressions?: string[];
     phase?: PhaseSQLVar;
     customFields?: Record<string, unknown>;
     // Additional filter to ensure we only get
@@ -5863,6 +5868,11 @@ ORDER BY column_name, count DESC
       SELECT
         ${castIdToString ? this.castToString(userIdCol) : userIdCol} as ${baseIdType},
         ${timestampDateTimeColumn} as timestamp,
+        ${
+          additionalSelectExpressions?.length
+            ? `${additionalSelectExpressions.join(",\n")},\n`
+            : ""
+        }
         ${metricCols.join(",\n")}
       FROM(
           ${sql}
@@ -6804,6 +6814,7 @@ ORDER BY column_name, count DESC
     settings: ExperimentSnapshotSettings;
     factTableMap: FactTableMap;
     lastMaxTimestamp: Date | null;
+    partitionSettings?: PartitionSettings;
     forcedUserIdType?: string;
   }): {
     factTablesWithMetricData: FactMetricSourceData[];
@@ -6888,9 +6899,14 @@ ORDER BY column_name, count DESC
       );
 
       // Get date range for new metric data that is needed
+      const useIngestPartitions = isIngestYearMonthDayPartitionSettings(
+        params.partitionSettings,
+      );
       const lastMaxTimestamp = params.lastMaxTimestamp;
       const bindingLastMaxTimestamp =
-        !!lastMaxTimestamp && lastMaxTimestamp > metricStart;
+        !useIngestPartitions &&
+        !!lastMaxTimestamp &&
+        lastMaxTimestamp > metricStart;
       const startDate =
         lastMaxTimestamp && bindingLastMaxTimestamp
           ? lastMaxTimestamp
@@ -6935,6 +6951,9 @@ ORDER BY column_name, count DESC
   ): string {
     const { exposureQuery, activationMetric, experimentDimensions } =
       this.parseExperimentParams(params);
+    const useIngestPartitions = isIngestYearMonthDayPartitionSettings(
+      params.partitionSettings,
+    );
 
     return format(
       `
@@ -6951,6 +6970,11 @@ ORDER BY column_name, count DESC
       ${experimentDimensions
         .map((d) => `, dim_exp_${d.id} ${this.getDataType("string")}`)
         .join("\n")}
+      ${
+        useIngestPartitions
+          ? `, last_ingested_partition ${this.getDataType("string")}`
+          : ""
+      }
       , max_timestamp ${this.getDataType("timestamp")}
     )
     ${this.createTablePartitions(["max_timestamp"])}
@@ -6985,19 +7009,68 @@ ORDER BY column_name, count DESC
     return `${tableAlias}.${trimmed}`;
   }
 
+  /**
+   * Returns a SQL expression that computes a zero-padded `yyyy-mm-dd` cursor
+   * string from the Y/M/D partition columns. Only valid for `ingestYearMonthDay`.
+   */
+  protected getIngestCursorExpression(
+    partitionSettings: PartitionSettings | undefined,
+    tableAlias?: string,
+  ): string {
+    if (!isIngestYearMonthDayPartitionSettings(partitionSettings)) {
+      throw new Error(
+        "getIngestCursorExpression requires ingestYearMonthDay partition settings",
+      );
+    }
+    const yearColumn = this.qualifyPartitionColumn(
+      partitionSettings.yearColumn,
+      tableAlias,
+    );
+    const monthColumn = this.qualifyPartitionColumn(
+      partitionSettings.monthColumn,
+      tableAlias,
+    );
+    const dayColumn = this.qualifyPartitionColumn(
+      partitionSettings.dayColumn,
+      tableAlias,
+    );
+
+    return `format(
+      '%04d-%02d-%02d',
+      CAST(${yearColumn} AS INTEGER),
+      CAST(${monthColumn} AS INTEGER),
+      CAST(${dayColumn} AS INTEGER)
+    )`;
+  }
+
   getPartitionWhereClause({
     partitionSettings,
     startDate,
     endDate,
+    lastIngestedPartition,
+    experimentStartDate,
     tableAlias,
   }: {
     partitionSettings?: PartitionSettings;
     startDate: Date;
     endDate?: Date | null;
+    /** For `ingestYearMonthDay`: exclusive lower bound `yyyy-mm-dd`; null = first run. */
+    lastIngestedPartition?: string | null;
+    /** For `ingestYearMonthDay`: used as inclusive lower bound on first run (when `lastIngestedPartition` is null). */
+    experimentStartDate?: Date;
     tableAlias?: string;
   }): string {
     if (!partitionSettings || partitionSettings.type === "timestamp") {
       return "";
+    }
+
+    if (partitionSettings.type === "ingestYearMonthDay") {
+      return this.getingestYearMonthDayWhereClause({
+        partitionSettings,
+        lastIngestedPartition: lastIngestedPartition ?? null,
+        experimentStartDate: experimentStartDate ?? startDate,
+        tableAlias,
+      });
     }
 
     const yearColumn = this.qualifyPartitionColumn(
@@ -7034,6 +7107,195 @@ ORDER BY column_name, count DESC
     return `${startClause} AND ${endClause}`;
   }
 
+  private parseYyyyMmDdIngestCursor(value: string): {
+    y: number;
+    m: number;
+    d: number;
+  } {
+    const trimmed = value.trim();
+    const match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(trimmed);
+    if (!match) {
+      throw new Error(
+        `Invalid latest scanned ingest partition (expected yyyy-mm-dd): ${value}`,
+      );
+    }
+    return {
+      y: parseInt(match[1], 10),
+      m: parseInt(match[2], 10),
+      d: parseInt(match[3], 10),
+    };
+  }
+
+  protected getStoredIngestCursorLiteral(value: string | null): string {
+    if (!value) return "CAST(NULL AS VARCHAR)";
+    const parsed = this.parseYyyyMmDdIngestCursor(value);
+    return `'${parsed.y.toString().padStart(4, "0")}-${parsed.m
+      .toString()
+      .padStart(2, "0")}-${parsed.d.toString().padStart(2, "0")}'`;
+  }
+
+  protected getSimpleSourceTableName(sql: string): string | null {
+    const normalized = sql.replace(/\s+/g, " ").trim();
+    if (!normalized || /^with\b/i.test(normalized)) {
+      return null;
+    }
+
+    const fromMatch =
+      /\bfrom\s+((?:"[^"]+"|`[^`]+`|[A-Za-z0-9_]+)(?:\.(?:"[^"]+"|`[^`]+`|[A-Za-z0-9_]+))*)/i.exec(
+        normalized,
+      );
+    if (!fromMatch) {
+      return null;
+    }
+
+    const remainder = normalized.slice(fromMatch.index + fromMatch[0].length);
+    const boundaryMatch =
+      /\b(where|group|order|limit|having|qualify|union|intersect|except)\b/i.exec(
+        remainder,
+      );
+    const relationTail = (
+      boundaryMatch ? remainder.slice(0, boundaryMatch.index) : remainder
+    ).trim();
+
+    if (
+      relationTail.startsWith("(") ||
+      relationTail.includes(",") ||
+      /\bjoin\b/i.test(relationTail)
+    ) {
+      return null;
+    }
+
+    return fromMatch[1] ?? null;
+  }
+
+  protected getMaxIngestedPartitionTableQuery({
+    sourceTableFullName,
+    partitionSettings,
+    lastIngestedPartition,
+    experimentStartDate,
+    tableAlias,
+  }: {
+    sourceTableFullName: string;
+    partitionSettings: Extract<
+      PartitionSettings,
+      { type: "ingestYearMonthDay" }
+    >;
+    lastIngestedPartition: string | null;
+    experimentStartDate: Date;
+    tableAlias?: string;
+  }): string {
+    const partitionWhereClause = this.getPartitionWhereClause({
+      partitionSettings,
+      startDate: experimentStartDate,
+      lastIngestedPartition,
+      experimentStartDate,
+      tableAlias,
+    });
+
+    return format(
+      `
+      SELECT
+        MAX(${this.getIngestCursorExpression(partitionSettings, tableAlias)}) AS last_ingested_partition
+      FROM ${sourceTableFullName}${tableAlias ? ` ${tableAlias}` : ""}
+      ${partitionWhereClause ? `WHERE (${partitionWhereClause})` : ""}
+      `,
+      this.getFormatDialect(),
+    );
+  }
+
+  getMaxIngestedPartitionSourceQuery({
+    sourceSql,
+    partitionSettings,
+    lastIngestedPartition,
+    experimentStartDate,
+  }: {
+    sourceSql: string;
+    partitionSettings?: PartitionSettings;
+    lastIngestedPartition: string | null;
+    experimentStartDate: Date;
+  }): string | null {
+    if (!isIngestYearMonthDayPartitionSettings(partitionSettings)) {
+      return null;
+    }
+
+    const sourceTableFullName = this.getSimpleSourceTableName(sourceSql);
+    if (!sourceTableFullName) {
+      return null;
+    }
+
+    return this.getMaxIngestedPartitionTableQuery({
+      sourceTableFullName,
+      partitionSettings,
+      lastIngestedPartition,
+      experimentStartDate,
+      tableAlias: "s",
+    });
+  }
+
+  /**
+   * Ingest-time Y/M/D partition pruning for Trino/Hive: integer tuple compare (no zero-padding assumption).
+   * No upper bound on partitions. First run (null cursor): inclusive lower bound at experiment start calendar day.
+   */
+  getingestYearMonthDayWhereClause({
+    partitionSettings,
+    lastIngestedPartition,
+    experimentStartDate,
+    tableAlias,
+  }: {
+    partitionSettings: Extract<
+      PartitionSettings,
+      { type: "ingestYearMonthDay" }
+    >;
+    lastIngestedPartition: string | null;
+    experimentStartDate: Date;
+    tableAlias?: string;
+  }): string {
+    if (this.getFormatDialect() !== "trino") {
+      throw new Error(
+        "ingestYearMonthDay partition strategy is only supported for Trino SQL dialect",
+      );
+    }
+
+    const yearColumn = this.qualifyPartitionColumn(
+      partitionSettings.yearColumn,
+      tableAlias,
+    );
+    const monthColumn = this.qualifyPartitionColumn(
+      partitionSettings.monthColumn,
+      tableAlias,
+    );
+    const dayColumn = this.qualifyPartitionColumn(
+      partitionSettings.dayColumn,
+      tableAlias,
+    );
+
+    // Use string comparison with zero-padded values (same strategy as
+    // yearMonthDay) so Trino can still perform static partition pruning.
+    const tupleGt = (year: string, month: string, day: string) => `(
+      (${yearColumn} = '${year}' AND ${monthColumn} = '${month}' AND ${dayColumn} > '${day}')
+      OR (${yearColumn} = '${year}' AND ${monthColumn} > '${month}')
+      OR (${yearColumn} > '${year}')
+    )`;
+
+    const tupleGte = (year: string, month: string, day: string) => `(
+      (${yearColumn} = '${year}' AND ${monthColumn} = '${month}' AND ${dayColumn} >= '${day}')
+      OR (${yearColumn} = '${year}' AND ${monthColumn} > '${month}')
+      OR (${yearColumn} > '${year}')
+    )`;
+
+    if (lastIngestedPartition) {
+      const p = this.parseYyyyMmDdIngestCursor(lastIngestedPartition);
+      return tupleGt(
+        p.y.toString().padStart(4, "0"),
+        p.m.toString().padStart(2, "0"),
+        p.d.toString().padStart(2, "0"),
+      );
+    }
+
+    const s = this.getDatePartitionParts(experimentStartDate);
+    return tupleGte(s.year, s.month, s.day);
+  }
+
   getUpdateExperimentIncrementalUnitsQuery(
     params: UpdateExperimentIncrementalUnitsQueryParams,
   ): string {
@@ -7060,8 +7322,13 @@ ORDER BY column_name, count DESC
       );
     }
 
+    const useIngestPartitions =
+      isIngestYearMonthDayPartitionSettings(partitionSettings);
+
     const lastMaxTimestampBinds =
-      params.lastMaxTimestamp && params.lastMaxTimestamp > settings.startDate;
+      !useIngestPartitions &&
+      params.lastMaxTimestamp &&
+      params.lastMaxTimestamp > settings.startDate;
 
     // TODO(incremental-refresh): What if "skip partial data" is true?
     // Does the conversionWindowsHour need to be set different?
@@ -7071,10 +7338,23 @@ ORDER BY column_name, count DESC
         ? params.lastMaxTimestamp
         : settings.startDate;
     const incrementalStartDateIso = incrementalStartDate.toISOString();
+    const newExposureTimestampClause = useIngestPartitions
+      ? `timestamp >= ${this.toTimestampWithMs(settings.startDate)}`
+      : lastMaxTimestampBinds && params.lastMaxTimestamp
+        ? `timestamp > ${this.toTimestampWithMs(params.lastMaxTimestamp)}`
+        : `timestamp >= ${this.toTimestampWithMs(settings.startDate)}`;
+    const newExposureEligibilityClause = [
+      `experiment_id = '${settings.experimentId}'`,
+      newExposureTimestampClause,
+      ...(endDate ? [`timestamp <= ${this.toTimestampWithMs(endDate)}`] : []),
+    ].join("\n              AND ");
+
     const partitionWhereClause = this.getPartitionWhereClause({
       partitionSettings,
       startDate: incrementalStartDate,
       endDate,
+      lastIngestedPartition: params.lastIngestedPartition ?? null,
+      experimentStartDate: settings.startDate,
     });
 
     // Segment and SQL filter only check against new exposures
@@ -7090,6 +7370,11 @@ ORDER BY column_name, count DESC
             , variation
             , first_exposure_timestamp AS timestamp
             , max_timestamp
+            ${
+              useIngestPartitions
+                ? `, ${this.getStoredIngestCursorLiteral(params.lastIngestedPartition ?? null)} AS last_ingested_partition`
+                : ""
+            }
             ${
               activationMetric
                 ? `, first_activation_timestamp AS activation_timestamp`
@@ -7129,39 +7414,94 @@ ORDER BY column_name, count DESC
             },
           })}
         )
-        , __filteredNewExposures AS (
-          SELECT 
+        ${
+          useIngestPartitions
+            ? `, __scannedExposures AS (
+          SELECT
             ${this.castToString(`${baseIdType}`)} AS ${baseIdType}
             , ${this.castToString(`variation_id`)} AS variation
             , timestamp AS timestamp
+            , MAX(${this.getIngestCursorExpression(partitionSettings)}) OVER () AS last_ingested_partition
+            , MAX(
+              CASE
+                WHEN ${newExposureEligibilityClause}
+                THEN timestamp
+                ELSE NULL
+              END
+            ) OVER () AS new_max_timestamp
+            , CASE
+              WHEN ${newExposureEligibilityClause}
+              THEN 1
+              ELSE 0
+            END AS contributes_exposure
+            ${activationMetric ? `, NULL AS activation_timestamp` : ""}
+            ${experimentDimensions
+              .map((d) => `, ${this.castToString(d.id)} AS dim_exp_${d.id}`)
+              .join("\n")}
+          FROM __newExposures
+          ${partitionWhereClause ? `WHERE (${partitionWhereClause})` : ""}
+        )`
+            : `, __filteredNewExposures AS (
+          SELECT
+            ${this.castToString(`${baseIdType}`)} AS ${baseIdType}
+            , ${this.castToString(`variation_id`)} AS variation
+            , timestamp AS timestamp
+            ${
+              useIngestPartitions
+                ? `, MAX(${this.getIngestCursorExpression(partitionSettings)}) OVER () AS last_ingested_partition`
+                : ""
+            }
             ${activationMetric ? `, NULL AS activation_timestamp` : ""}
             ${experimentDimensions
               .map((d) => `, ${this.castToString(d.id)} AS dim_exp_${d.id}`)
               .join("\n")}
           FROM __newExposures
           WHERE 
-            experiment_id = '${settings.experimentId}'
-            ${
-              lastMaxTimestampBinds && params.lastMaxTimestamp
-                ? `AND timestamp > ${this.toTimestampWithMs(params.lastMaxTimestamp)}`
-                : `AND timestamp >= ${this.toTimestampWithMs(settings.startDate)}`
-            }
-            ${endDate ? `AND timestamp <= ${this.toTimestampWithMs(endDate)}` : ""}
+            ${newExposureEligibilityClause}
             ${partitionWhereClause ? `AND (${partitionWhereClause})` : ""}
             
-        )
+        )`
+        }
         , __jointExposures AS (
-          SELECT * FROM __existingUnits
+          ${
+            useIngestPartitions
+              ? `SELECT
+            ${baseIdType}
+            , variation
+            , timestamp
+            , max_timestamp
+            , last_ingested_partition
+            , 1 AS contributes_exposure
+            ${activationMetric ? `, activation_timestamp` : ""}
+            ${experimentDimensions.map((d) => `, dim_exp_${d.id}`).join("\n")}
+          FROM __existingUnits`
+              : `SELECT * FROM __existingUnits`
+          }
           UNION ALL
           (
-            SELECT
+            ${
+              useIngestPartitions
+                ? `SELECT
+              ${baseIdType}
+              , CASE WHEN contributes_exposure = 1 THEN variation ELSE NULL END AS variation
+              , CASE WHEN contributes_exposure = 1 THEN timestamp ELSE NULL END AS timestamp
+              , CASE WHEN contributes_exposure = 1 THEN new_max_timestamp ELSE NULL END AS max_timestamp
+              , last_ingested_partition
+              , contributes_exposure
+              ${activationMetric ? `, activation_timestamp` : ""}
+              ${experimentDimensions.map((d) => `, dim_exp_${d.id}`).join("\n")}
+            FROM __scannedExposures`
+                : `SELECT
               ${baseIdType}
               , variation
               , timestamp
               , MAX(timestamp) OVER () AS max_timestamp
+              ${useIngestPartitions ? `, last_ingested_partition` : ""}
               ${activationMetric ? `, activation_timestamp` : ""}
               ${experimentDimensions.map((d) => `, dim_exp_${d.id}`).join("\n")}
             FROM __filteredNewExposures
+            `
+            }
           )
         )
         , __experimentUnits AS (
@@ -7174,6 +7514,13 @@ ORDER BY column_name, count DESC
             )} AS variation
             , MIN(e.timestamp) AS first_exposure_timestamp
             , MIN(e.max_timestamp) AS max_timestamp
+            ${
+              useIngestPartitions
+                ? `
+            , MAX(e.last_ingested_partition) AS last_ingested_partition
+            , MAX(e.contributes_exposure) AS has_exposure_row`
+                : ""
+            }
             ${experimentDimensions
               .map(
                 (d) => `
@@ -7184,14 +7531,34 @@ ORDER BY column_name, count DESC
           GROUP BY
             ${baseIdType}
         )
+        ${
+          useIngestPartitions
+            ? `, __experimentUnitsWithGlobalWatermark AS (
+          SELECT
+            *
+            , MAX(last_ingested_partition) OVER () AS global_last_ingested_partition
+          FROM __experimentUnits
+        )`
+            : ""
+        }
         SELECT 
           ${baseIdType}
           , variation
           , first_exposure_timestamp
           ${activationMetric ? `, first_activation_timestamp` : ""}
           ${experimentDimensions.map((d) => `, dim_exp_${d.id}`).join("\n")}
+          ${
+            useIngestPartitions
+              ? `, global_last_ingested_partition AS last_ingested_partition`
+              : ""
+          }
           , max_timestamp
-        FROM __experimentUnits
+        FROM ${
+          useIngestPartitions
+            ? "__experimentUnitsWithGlobalWatermark"
+            : "__experimentUnits"
+        }
+        ${useIngestPartitions ? `WHERE has_exposure_row = 1` : ""}
       )
       `,
       this.getFormatDialect(),
@@ -7228,6 +7595,18 @@ ORDER BY column_name, count DESC
   getMaxTimestampIncrementalUnitsQuery(
     params: MaxTimestampIncrementalUnitsQueryParams,
   ): string {
+    if (params.includeLastIngestedPartition) {
+      return format(
+        `
+        SELECT
+          MAX(max_timestamp) AS max_timestamp,
+          MAX(last_ingested_partition) AS last_ingested_partition
+        FROM ${params.unitsTableFullName}
+        `,
+        this.getFormatDialect(),
+      );
+    }
+
     return format(
       `
       SELECT MAX(max_timestamp) AS max_timestamp FROM ${params.unitsTableFullName}
@@ -7251,8 +7630,21 @@ ORDER BY column_name, count DESC
       };
     }
 
+    const lastIngestedPartition = (
+      row as { last_ingested_partition?: string | null }
+    ).last_ingested_partition;
+
     return {
-      rows: [{ max_timestamp: row.max_timestamp }],
+      rows: [
+        {
+          max_timestamp: row.max_timestamp,
+          ...(lastIngestedPartition != null
+            ? {
+                last_ingested_partition: lastIngestedPartition,
+              }
+            : {}),
+        },
+      ],
       statistics,
     };
   }
@@ -7291,6 +7683,18 @@ ORDER BY column_name, count DESC
   getMaxTimestampMetricSourceQuery(
     params: MaxTimestampMetricSourceQueryParams,
   ): string {
+    if (params.includeLastIngestedPartition) {
+      return format(
+        `
+        SELECT
+          MAX(max_timestamp) AS max_timestamp,
+          MAX(last_ingested_partition) AS last_ingested_partition
+        FROM ${params.metricSourceTableFullName}
+        `,
+        this.getFormatDialect(),
+      );
+    }
+
     return format(
       `
       SELECT MAX(max_timestamp) AS max_timestamp FROM ${params.metricSourceTableFullName}
@@ -7396,6 +7800,8 @@ ORDER BY column_name, count DESC
       partitionSettings: params.partitionSettings,
       startDate: factTableWithMetricData.minCovariateStartDate,
       endDate: factTableWithMetricData.maxCovariateEndDate,
+      lastIngestedPartition: params.lastIngestedPartition ?? null,
+      experimentStartDate: params.settings.startDate,
       tableAlias: "m",
     });
 
@@ -7533,6 +7939,7 @@ ORDER BY column_name, count DESC
     const columnDefinitions = this.getMetricSourceTableColumnDefinitions(
       baseIdType,
       sortedMetrics,
+      params.partitionSettings,
     );
 
     if (
@@ -7568,6 +7975,7 @@ ORDER BY column_name, count DESC
   protected getMetricSourceTableSchema(
     baseIdType: string,
     metrics: FactMetricInterface[],
+    partitionSettings?: PartitionSettings,
   ): Map<string, string> {
     const schema = new Map<string, string>();
 
@@ -7596,6 +8004,9 @@ ORDER BY column_name, count DESC
     });
 
     schema.set("refresh_timestamp", this.getDataType("timestamp"));
+    if (isIngestYearMonthDayPartitionSettings(partitionSettings)) {
+      schema.set("last_ingested_partition", this.getDataType("string"));
+    }
     schema.set("max_timestamp", this.getDataType("timestamp"));
     schema.set("metric_date", this.getDataType("date"));
 
@@ -7605,8 +8016,13 @@ ORDER BY column_name, count DESC
   protected getMetricSourceTableColumnDefinitions(
     baseIdType: string,
     metrics: FactMetricInterface[],
+    partitionSettings?: PartitionSettings,
   ): string[] {
-    const schema = this.getMetricSourceTableSchema(baseIdType, metrics);
+    const schema = this.getMetricSourceTableSchema(
+      baseIdType,
+      metrics,
+      partitionSettings,
+    );
     return Array.from(schema.entries()).map(
       ([columnName, dataType]) => `${columnName} ${dataType}`,
     );
@@ -7615,8 +8031,13 @@ ORDER BY column_name, count DESC
   protected getMetricSourceTableColumns(
     baseIdType: string,
     metrics: FactMetricInterface[],
+    partitionSettings?: PartitionSettings,
   ): string[] {
-    const schema = this.getMetricSourceTableSchema(baseIdType, metrics);
+    const schema = this.getMetricSourceTableSchema(
+      baseIdType,
+      metrics,
+      partitionSettings,
+    );
     return Array.from(schema.keys());
   }
 
@@ -7724,10 +8145,15 @@ ORDER BY column_name, count DESC
     }
     const factTableWithMetricData = factTablesWithMetricData[0];
     const metricData = factTableWithMetricData.metricData;
+    const useIngestPartitions = isIngestYearMonthDayPartitionSettings(
+      params.partitionSettings,
+    );
     const metricPartitionWhereClause = this.getPartitionWhereClause({
       partitionSettings: params.partitionSettings,
       startDate: factTableWithMetricData.metricStart,
       endDate: factTableWithMetricData.metricEnd,
+      lastIngestedPartition: params.lastIngestedPartition ?? null,
+      experimentStartDate: params.settings.startDate,
       tableAlias: "m",
     });
 
@@ -7735,6 +8161,7 @@ ORDER BY column_name, count DESC
     const columnNames = this.getMetricSourceTableColumns(
       baseIdType,
       sortedMetrics,
+      params.partitionSettings,
     );
 
     return format(
@@ -7759,19 +8186,30 @@ ORDER BY column_name, count DESC
           additionalWhere: metricPartitionWhereClause
             ? [metricPartitionWhereClause]
             : undefined,
+          additionalSelectExpressions: useIngestPartitions
+            ? [
+                `${this.getIngestCursorExpression(
+                  params.partitionSettings,
+                  "m",
+                )} AS last_ingested_partition`,
+              ]
+            : undefined,
           // if last max timestamp is later than metric start and thus the start
           // date, we need to get data strictly greater than, not just greater than
           // or equal to the start date
           exclusiveStartDateFilter:
             factTableWithMetricData.bindingLastMaxTimestamp,
         })})
-        , __maxTimestamp AS (
-          SELECT ${this.castToTimestamp("MAX(timestamp)")} AS max_timestamp FROM __factTable
-        )
         , __newMetricRows AS (
           SELECT
             m.${baseIdType} AS ${baseIdType}
             , m.timestamp AS timestamp
+            , MAX(${this.castToTimestamp("m.timestamp")}) OVER () AS max_timestamp
+            ${
+              useIngestPartitions
+                ? `, MAX(m.last_ingested_partition) OVER () AS last_ingested_partition`
+                : ""
+            }
             ${metricData
               .map(
                 (data) =>
@@ -7814,6 +8252,12 @@ ORDER BY column_name, count DESC
           SELECT
             ${baseIdType}
             , ${this.castToDate("timestamp")} AS metric_date
+            , MIN(max_timestamp) AS max_timestamp
+            ${
+              useIngestPartitions
+                ? `, MAX(last_ingested_partition) AS last_ingested_partition`
+                : ""
+            }
             ${metricData
               .map((m) => {
                 // Use partial aggregation function since we are
@@ -7823,10 +8267,10 @@ ORDER BY column_name, count DESC
                 const denomAggFunction =
                   m.denominatorAggFns.partialAggregationFunction;
                 return `
-                , ${aggfunction(`${m.alias}_value`)} AS ${this.encodeMetricIdForColumnName(m.id)}_value
+                , CAST(${aggfunction(`${m.alias}_value`)} AS ${this.getDataType(m.numeratorAggFns.intermediateDataType)}) AS ${this.encodeMetricIdForColumnName(m.id)}_value
                 ${
                   !!denomAggFunction && isRatioMetric(m.metric)
-                    ? `, ${denomAggFunction(`${m.alias}_denominator`)} AS ${this.encodeMetricIdForColumnName(m.id)}_denominator_value`
+                    ? `, CAST(${denomAggFunction(`${m.alias}_denominator`)} AS ${this.getDataType(m.denominatorAggFns.intermediateDataType)}) AS ${this.encodeMetricIdForColumnName(m.id)}_denominator_value`
                     : ""
                 }
               `;
@@ -7849,11 +8293,15 @@ ORDER BY column_name, count DESC
                 }`,
             )
             .join("\n")}
-          , ${this.getCurrentTimestamp()} AS refresh_timestamp
-          , mt.max_timestamp AS max_timestamp
+          , ${this.castToTimestamp(this.getCurrentTimestamp())} AS refresh_timestamp
+          ${
+            useIngestPartitions
+              ? `, dv.last_ingested_partition AS last_ingested_partition`
+              : ""
+          }
+          , dv.max_timestamp AS max_timestamp
           , dv.metric_date AS metric_date
         FROM __newDailyValues dv
-        CROSS JOIN __maxTimestamp mt
 )
       `,
       this.getFormatDialect(),
